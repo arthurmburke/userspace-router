@@ -139,7 +139,7 @@ impl Mbuf {
     /// The returned bytes are uninitialised; write them before reading.
     #[inline]
     pub unsafe fn append(&mut self, len: u16) -> Option<&mut [u8]> {
-        let tail = unsafe { ffi::rte_pktmbuf_append(self.raw.as_ptr(), len) } as *mut u8;
+        let tail = unsafe { ffi::rte_pktmbuf_append(self.raw.as_ptr(), len) };
         if tail.is_null() {
             None
         } else {

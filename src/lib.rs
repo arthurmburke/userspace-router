@@ -1,10 +1,8 @@
 use crate::mem::alloc::Arena;
 
 pub mod dpdk;
-pub mod engine;
 pub mod mem;
 pub mod net;
-pub mod protocol;
 pub mod core;
 
 include!("generated.rs");
