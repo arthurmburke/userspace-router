@@ -42,7 +42,7 @@ impl<T> ObjectPool<T> {
             size_of::<T>() != 0,
             "ObjectPool does not support zero-sized types"
         );
-        
+
         Self {
             slots: (0..capacity)
                 .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
@@ -94,7 +94,11 @@ impl<T> ObjectPool<T> {
             cell as *mut T
         };
 
-        Some(Obj { pool: self, index, value })
+        Some(Obj {
+            pool: self,
+            index,
+            value,
+        })
     }
 
     /// Return slot `index` to the free-list, optionally running the value's

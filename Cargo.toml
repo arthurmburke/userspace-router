@@ -11,6 +11,8 @@ default = ["dpdk"]
 dpdk = []
 
 [dependencies]
+toml = "1.1.2"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [build-dependencies]
 bindgen = "0.71"

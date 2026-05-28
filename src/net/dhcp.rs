@@ -565,6 +565,87 @@ impl<'a> Lease<'a> {
     }
 }
 
+/// Writes DHCP option TLVs into the region *after* the magic cookie, tracking
+/// how many bytes were used. Each writer method returns `false` (without
+/// advancing) if the option wouldn't fit, so a caller can detect truncation;
+/// finish with [`OptionsWriter::end`] to emit the `END` marker.
+pub struct OptionsWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> OptionsWriter<'a> {
+    #[inline]
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, len: 0 }
+    }
+
+    /// Bytes written so far (including a trailing `END` once emitted).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Write one `code`/`value` option. Fails if `value` exceeds 255 bytes or
+    /// the buffer is full.
+    #[must_use]
+    pub fn option(&mut self, code: u8, value: &[u8]) -> bool {
+        let need = 2 + value.len();
+        if value.len() > u8::MAX as usize || self.len + need > self.buf.len() {
+            return false;
+        }
+        self.buf[self.len] = code;
+        self.buf[self.len + 1] = value.len() as u8;
+        self.buf[self.len + 2..self.len + need].copy_from_slice(value);
+        self.len += need;
+        true
+    }
+
+    #[must_use]
+    pub fn message_type(&mut self, t: MessageType) -> bool {
+        self.option(option::MESSAGE_TYPE, &[t.to_u8()])
+    }
+    #[must_use]
+    pub fn ipv4(&mut self, code: u8, addr: Ipv4Addr) -> bool {
+        self.option(code, &addr.octets())
+    }
+    #[must_use]
+    pub fn seconds(&mut self, code: u8, secs: u32) -> bool {
+        self.option(code, &secs.to_be_bytes())
+    }
+    #[must_use]
+    pub fn ipv4_list(&mut self, code: u8, addrs: &[Ipv4Addr]) -> bool {
+        let vlen = addrs.len() * IPV4_LEN;
+        if vlen > u8::MAX as usize || self.len + 2 + vlen > self.buf.len() {
+            return false;
+        }
+        self.buf[self.len] = code;
+        self.buf[self.len + 1] = vlen as u8;
+        let mut o = self.len + 2;
+        for a in addrs {
+            self.buf[o..o + IPV4_LEN].copy_from_slice(&a.octets());
+            o += IPV4_LEN;
+        }
+        self.len += 2 + vlen;
+        true
+    }
+
+    /// Emit the terminating `END` option.
+    #[must_use]
+    pub fn end(&mut self) -> bool {
+        if self.len + 1 > self.buf.len() {
+            return false;
+        }
+        self.buf[self.len] = option::END;
+        self.len += 1;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,13 +659,44 @@ mod tests {
     fn parses_ack_into_lease() {
         let header = DhcpHeader::default();
         let opts = [
-            option::MESSAGE_TYPE, 1, message_type::ACK,
-            option::SERVER_ID, IPV4_OPT_LEN, 192, 168, 1, 1,
+            option::MESSAGE_TYPE,
+            1,
+            message_type::ACK,
+            option::SERVER_ID,
+            IPV4_OPT_LEN,
+            192,
+            168,
+            1,
+            1,
             // 0x0000_0E10 == 3600 seconds.
-            option::LEASE_TIME, SECONDS_OPT_LEN, 0x00, 0x00, 0x0e, 0x10,
-            option::SUBNET_MASK, IPV4_OPT_LEN, 255, 255, 255, 0,
-            option::ROUTER, IPV4_OPT_LEN, 192, 168, 1, 254,
-            option::DNS_SERVER, 8, 8, 8, 8, 8, 1, 1, 1, 1,
+            option::LEASE_TIME,
+            SECONDS_OPT_LEN,
+            0x00,
+            0x00,
+            0x0e,
+            0x10,
+            option::SUBNET_MASK,
+            IPV4_OPT_LEN,
+            255,
+            255,
+            255,
+            0,
+            option::ROUTER,
+            IPV4_OPT_LEN,
+            192,
+            168,
+            1,
+            254,
+            option::DNS_SERVER,
+            8,
+            8,
+            8,
+            8,
+            8,
+            1,
+            1,
+            1,
+            1,
             option::END,
         ];
 
@@ -612,17 +724,36 @@ mod tests {
         let header = DhcpHeader::default();
 
         let offer_opts = [
-            option::MESSAGE_TYPE, 1, message_type::OFFER,
-            option::SERVER_ID, IPV4_OPT_LEN, 10, 0, 0, 1,
+            option::MESSAGE_TYPE,
+            1,
+            message_type::OFFER,
+            option::SERVER_ID,
+            IPV4_OPT_LEN,
+            10,
+            0,
+            0,
+            1,
             option::END,
         ];
         let offer = Offer::parse(&header, &offer_opts).expect("OFFER");
         assert_eq!(offer.server_id(), Some(Ipv4Addr::new(10, 0, 0, 1)));
 
         let request_opts = [
-            option::MESSAGE_TYPE, 1, message_type::REQUEST,
-            option::REQUESTED_IP, IPV4_OPT_LEN, 10, 0, 0, 50,
-            option::SERVER_ID, IPV4_OPT_LEN, 10, 0, 0, 1,
+            option::MESSAGE_TYPE,
+            1,
+            message_type::REQUEST,
+            option::REQUESTED_IP,
+            IPV4_OPT_LEN,
+            10,
+            0,
+            0,
+            50,
+            option::SERVER_ID,
+            IPV4_OPT_LEN,
+            10,
+            0,
+            0,
+            1,
             option::END,
         ];
         let request = Request::parse(&header, &request_opts).expect("REQUEST");

@@ -74,7 +74,10 @@ impl FreeList {
         let aligned = align_up(raw, ALIGN as u64);
         let pad = (aligned - raw) as usize;
         let usable = (size - pad) & !(ALIGN - 1);
-        assert!(usable >= MIN_BLOCK, "arena too small for the free-list header");
+        assert!(
+            usable >= MIN_BLOCK,
+            "arena too small for the free-list header"
+        );
 
         // SAFETY: `pad < size`, so this stays within the caller's region.
         let base = unsafe { base.add(pad) };
@@ -269,9 +272,9 @@ unsafe impl<const N: usize> Send for Arena<N> {}
 unsafe impl<const N: usize> GlobalAlloc for Arena<N> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let mut slot = self.heap.lock();
-        let heap = slot.as_mut().get_or_insert_with(|| unsafe {
-            FreeList::new(self.data.get() as *mut u8, N)
-        });
+        let heap = slot
+            .as_mut()
+            .get_or_insert_with(|| unsafe { FreeList::new(self.data.get() as *mut u8, N) });
         unsafe { heap.alloc(layout) }
     }
 

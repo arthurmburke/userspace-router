@@ -135,7 +135,11 @@ pub fn mut_from<T: Pod>(buf: &mut [u8]) -> Option<&mut T> {
 /// is convenient for peeling successive layers (eth -> ip -> tcp -> payload).
 #[inline]
 pub fn ref_from_prefix<T: Pod>(buf: &[u8]) -> Option<(&T, &[u8])> {
-    debug_assert_eq!(align_of::<T>(), POD_ALIGN, "Pod types must have alignment 1");
+    debug_assert_eq!(
+        align_of::<T>(),
+        POD_ALIGN,
+        "Pod types must have alignment 1"
+    );
     if buf.len() < size_of::<T>() {
         return None;
     }
@@ -148,7 +152,11 @@ pub fn ref_from_prefix<T: Pod>(buf: &[u8]) -> Option<(&T, &[u8])> {
 /// Mutable counterpart of [`ref_from_prefix`].
 #[inline]
 pub fn mut_from_prefix<T: Pod>(buf: &mut [u8]) -> Option<(&mut T, &mut [u8])> {
-    debug_assert_eq!(align_of::<T>(), POD_ALIGN, "Pod types must have alignment 1");
+    debug_assert_eq!(
+        align_of::<T>(),
+        POD_ALIGN,
+        "Pod types must have alignment 1"
+    );
     if buf.len() < size_of::<T>() {
         return None;
     }

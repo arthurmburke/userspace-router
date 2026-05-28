@@ -1,9 +1,10 @@
 use crate::mem::alloc::Arena;
 
+pub mod core;
 pub mod dpdk;
 pub mod mem;
 pub mod net;
-pub mod core;
+pub mod router;
 
 include!("generated.rs");
 

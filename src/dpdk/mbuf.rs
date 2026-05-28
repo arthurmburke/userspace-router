@@ -128,7 +128,9 @@ impl Mbuf {
     /// ```
     #[inline]
     pub fn header_at_mut<T: Pod>(&mut self, offset: usize) -> Option<&mut T> {
-        self.data_mut().get_mut(offset..).and_then(wire::mut_from::<T>)
+        self.data_mut()
+            .get_mut(offset..)
+            .and_then(wire::mut_from::<T>)
     }
 
     /// Append `len` bytes to the tail of the (last segment of the) packet and

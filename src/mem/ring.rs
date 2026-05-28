@@ -106,7 +106,7 @@ impl<T, const N: usize> SpscRing<T, N> {
 struct ControlBlock<T, const N: usize> {
     ring: Box<SpscRing<T, N>>,
     has_rx: AtomicBool,
-    has_tx: AtomicBool
+    has_tx: AtomicBool,
 }
 
 pub struct Rx<T, const N: usize> {
@@ -197,10 +197,7 @@ pub fn channel<T, const N: usize>() -> (Tx<T, N>, Rx<T, N>) {
         has_tx: AtomicBool::new(true),
     });
     let cb_ptr = Box::into_raw(cb);
-    (
-        Tx { cb: cb_ptr },
-        Rx { cb: cb_ptr },
-    )
+    (Tx { cb: cb_ptr }, Rx { cb: cb_ptr })
 }
 
 // SAFETY: Tx & Rx are designed for single-producer, single-consumer use.
