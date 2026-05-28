@@ -1,0 +1,1 @@
+pub const HEAP_SIZE: usize = 1073741824;

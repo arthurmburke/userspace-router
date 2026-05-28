@@ -2,7 +2,7 @@
 
 use crate::net::ethernet::{self, BROADCAST, EthernetHeader, MacAddr};
 use crate::net::wire::{Pod, U16Be, mut_from_prefix};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
 /// Hardware type.
@@ -175,7 +175,7 @@ pub fn build_reply(
 /// blocking.
 #[derive(Debug, Default)]
 pub struct NeighborCache {
-    entries: HashMap<Ipv4Addr, MacAddr>,
+    entries: BTreeMap<Ipv4Addr, MacAddr>,
 }
 
 impl NeighborCache {

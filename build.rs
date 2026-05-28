@@ -74,4 +74,52 @@ fn main() {
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-deprecated-declarations")
         .compile("dpdk_static_fns");
+
+    let heap_size_str =
+        env::var("HEAP_SIZE")
+            .unwrap_or_else(|_| "1GiB".into());
+
+    let heap_size = parse_size(&heap_size_str);
+
+    let generated = format!(
+        "pub const HEAP_SIZE: usize = {};",
+        heap_size
+    );
+
+    std::fs::write("src/generated.rs", generated)
+        .expect("failed to write generated.rs");
+
+    println!("cargo:rerun-if-env-changed=HEAP_SIZE");
 }
+
+fn parse_size(input: &str) -> usize {
+    let s = input.trim();
+
+    let units = [
+        ("KiB", 1024usize),
+        ("MiB", 1024usize.pow(2)),
+        ("GiB", 1024usize.pow(3)),
+        ("TiB", 1024usize.pow(4)),
+
+        ("KB", 1000usize),
+        ("MB", 1000usize.pow(2)),
+        ("GB", 1000usize.pow(3)),
+        ("TB", 1000usize.pow(4)),
+
+        ("B", 1),
+    ];
+
+    for (suffix, multiplier) in units {
+        if let Some(number) = s.strip_suffix(suffix) {
+            let value: usize = number.trim()
+                .parse()
+                .expect("invalid numeric value");
+
+            return value * multiplier;
+        }
+    }
+
+    // No suffix => bytes
+    s.parse().expect("invalid size")
+}
+
