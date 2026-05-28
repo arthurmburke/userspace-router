@@ -1,0 +1,30 @@
+{
+    "name": "quicktcp-dpdk",
+    "build": {
+        "dockerfile": "../Dockerfile"
+    },
+    "runArgs": [
+        "--privileged",
+        "--cap-add=IPC_LOCK",
+        "--cap-add=NET_ADMIN",
+        "--cap-add=SYS_NICE"
+    ],
+    "containerEnv": {
+        "RTE_SDK": "/usr",
+        "RUST_BACKTRACE": "1"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "vadimcn.vscode-lldb",
+                "ms-vscode.cpptools"
+            ],
+            "settings": {
+                "rust-analyzer.cargo.buildScripts.enable": true,
+                "rust-analyzer.check.command": "clippy"
+            }
+        }
+    },
+    "remoteUser": "root"
+}

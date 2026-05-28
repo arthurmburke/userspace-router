@@ -1,0 +1,27 @@
+[package]
+name = "quicktcp"
+version = "0.1.0"
+edition = "2024"
+description = "Userspace TCP stack in Rust over DPDK"
+license = "MIT"
+build = "build.rs"
+
+[features]
+default = ["dpdk"]
+dpdk = []
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.71"
+pkg-config = "0.3"
+cc = "1.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.release.build-override]
+opt-level = 0
