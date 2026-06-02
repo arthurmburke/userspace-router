@@ -1,4 +1,4 @@
-//! quicktcp router runtime.
+//! userspace_router router runtime.
 //!
 //! Single-core skeleton that brings the control plane online: the WAN port runs
 //! a DHCP client to obtain the router's address; each LAN port answers ARP for
@@ -18,18 +18,18 @@ fn main() {
 
 #[cfg(feature = "dpdk")]
 mod runtime {
-    use quicktcp::dpdk::lcore::LcoreIter;
-    use quicktcp::dpdk::mbuf::Mbuf;
-    use quicktcp::dpdk::mempool::{MemPool, SharedMemPool};
-    use quicktcp::dpdk::port::{self, Port, PortConfig};
-    use quicktcp::dpdk::{self, ffi};
-    use quicktcp::router::app::{self, AppCtx, LanPortCtx, PortCtx, WanPortCtx, launch_worker};
-    use quicktcp::router::conf::{InterfaceRole, RouterConfig};
-    use quicktcp::router::dhcp::{DhcpClient, DhcpServer, DhcpServerConfig, SharedDhcpClient};
-    use quicktcp::router::fdb::SharedFdb;
-    use quicktcp::router::leases::SharedLeases;
-    use quicktcp::router::neighbor::SharedNeighbor;
-    use quicktcp::router::pool::SharedAddressPool;
+    use userspace_router::dpdk::lcore::LcoreIter;
+    use userspace_router::dpdk::mbuf::Mbuf;
+    use userspace_router::dpdk::mempool::{MemPool, SharedMemPool};
+    use userspace_router::dpdk::port::{self, Port, PortConfig};
+    use userspace_router::dpdk::{self, ffi};
+    use userspace_router::router::app::{self, AppCtx, LanPortCtx, PortCtx, WanPortCtx, launch_worker};
+    use userspace_router::router::conf::{InterfaceRole, RouterConfig};
+    use userspace_router::router::dhcp::{DhcpClient, DhcpServer, DhcpServerConfig, SharedDhcpClient};
+    use userspace_router::router::fdb::SharedFdb;
+    use userspace_router::router::leases::SharedLeases;
+    use userspace_router::router::neighbor::SharedNeighbor;
+    use userspace_router::router::pool::SharedAddressPool;
     use std::collections::BTreeMap;
     use std::ffi::CString;
     use std::io::Read;
@@ -208,7 +208,7 @@ mod runtime {
         // LAN segment can hold their own handle to the same cache + pending
         // queue; today the runtime is single-core, but the wiring is forward-
         // compatible.
-        let software_defined_addr = quicktcp::net::util::software_defined_mac(server_ip);
+        let software_defined_addr = userspace_router::net::util::software_defined_mac(server_ip);
         let lan_neighbor = SharedNeighbor::<Mbuf>::new(software_defined_addr, server_ip);
 
         let lan: Vec<PortCtx> = ports
@@ -255,8 +255,13 @@ mod runtime {
                 // queue spinlocks on `Port`, `WanPortCtx::bound`), and the
                 // per-lcore RX-queue assignment guarantees no two lcores poll
                 // the same hardware queue.
-                let ctx = Arc::clone(&ctx);
-                launch_worker(lcore.id, ctx);
+                let ctx_clone = Arc::clone(&ctx);
+                if let Err(rc) = launch_worker(lcore.id, ctx_clone) {
+                    eprintln!(
+                        "[WARN]: rte_eal_remote_launch(lcore={}) failed: {rc}; running without it",
+                        lcore.id
+                    );
+                }
             }
         }
 
@@ -288,6 +293,13 @@ mod runtime {
                 eprintln!("[WARN]: rte_eth_dev_close(port={p}) failed: {rc}");
             }
         }
+
+        // Drop everything that still references EAL-owned memory (ports' mbuf
+        // pool handles, then the `socket_pools` map itself) BEFORE
+        // `rte_eal_cleanup`. Otherwise the last `SharedMemPool` clone would
+        // drop *after* cleanup and call `rte_mempool_free` on freed memory.
+        drop(ctx);
+        drop(socket_pools);
 
         if unsafe { ffi::rte_eal_cleanup() } != 0 {
             eprintln!("rte_eal_cleanup failed");

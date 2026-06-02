@@ -19,7 +19,7 @@ fn main() {
 
 #[cfg(feature = "dpdk")]
 fn run() {
-    use quicktcp::dpdk::{ffi, port};
+    use userspace_router::dpdk::{ffi, port};
     use std::ffi::CString;
 
     // Forward this process's argv straight to EAL.

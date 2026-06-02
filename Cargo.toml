@@ -1,5 +1,5 @@
 [package]
-name = "quicktcp"
+name = "userspace-router"
 version = "0.1.0"
 edition = "2024"
 description = "Userspace TCP stack in Rust over DPDK"

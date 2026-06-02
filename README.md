@@ -1,6 +1,9 @@
-# quicktcp
+# userspace-router
 
-Highly optimized TCP implementation using DPDK, with raw C FFI bindings generated from the installed DPDK headers via `bindgen`.
+A userspace router leveraging DPDK. The primitives are designed to be extensible. Syscalls are almost avoided entirely
+using a custom allocator that allocates from a const-array memory region is global data. The only kernel function here
+is for SIGINT handling. DPDK primitives are wrapped in rust structs to help avoid memory bugs arising from the DPDK
+memory management model.
 
 ## Layout
 
@@ -11,14 +14,18 @@ src/
     ffi.rs          bindgen-generated bindings (include!d from OUT_DIR)
     mbuf.rs         rte_mbuf helpers
     port.rs         ethdev configuration / queues / start-stop
-  engine/
-    event_loop.rs   busy-poll RX/TX on an isolated lcore
+    pool.rs         rte_mempool helpers
+  core/
+    spinlock.rs     spinlock mutex / rw lock implementation
+    bitmask.rs      bitmask implementation
   mem/
-    pool.rs         rte_mempool wrappers
+    pool.rs         persistent object allocation (free list)
     ring.rs         rte_ring wrappers
+    alloc.rs        custom static memory allocator
   net/              header parsing / state machine
-    ethernet.rs ip.rs tcp.rs arp.rs checksum.rs
-  protocol/         app-layer (placeholder mirrored from reference)
+    ethernet.rs ip.rs tcp.rs udp.rs dhcp.rs dns.rs arp.rs checksum.rs wire.rs
+  router/
+    router implementation code
 wrapper.h           top-level include passed to bindgen
 build.rs            pkg-config(libdpdk) + bindgen + cc for static-fn shims
 ```

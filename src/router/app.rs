@@ -3,9 +3,10 @@
 
 use std::{
     net::Ipv4Addr,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
     time::Instant,
 };
@@ -65,18 +66,38 @@ unsafe extern "C" fn run(arg: *mut std::os::raw::c_void) -> std::os::raw::c_int 
     // reclaims ownership so the `WorkerCtx` (and its `Arc<AppCtx>`) is dropped
     // when the worker exits.
     let ctx = unsafe { Box::from_raw(arg as *mut WorkerCtx) };
-    ctx.run();
-    0
+    // Unwinding past an `extern "C"` boundary is undefined behaviour, so catch
+    // any panic in the worker, log it, request shutdown, and return non-zero.
+    // The main thread will see SHUTDOWN and unwind its own loop cleanly.
+    let lcore = ctx.lcore;
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| ctx.run()));
+    match result {
+        Ok(()) => 0,
+        Err(_) => {
+            eprintln!("[ERROR]: worker on lcore {lcore} panicked; requesting shutdown");
+            SHUTDOWN.store(true, Ordering::Release);
+            1
+        }
+    }
 }
 
-/// Launches a worker on the provided `lcore`.
-pub fn launch_worker(lcore: u32, app: Arc<AppCtx>) {
+/// Launches a worker on the provided `lcore`. Returns `Ok(())` on success or
+/// the raw `rte_eal_remote_launch` error code on failure (e.g. `-EBUSY` if the
+/// lcore is already running). On failure the `WorkerCtx` is reclaimed so its
+/// `Arc<AppCtx>` doesn't leak.
+pub fn launch_worker(lcore: u32, app: Arc<AppCtx>) -> Result<(), i32> {
     let ctx = Box::new(WorkerCtx { lcore, app });
     let ctx_ptr = Box::into_raw(ctx) as *mut std::os::raw::c_void;
-    // SAFETY: `ctx_ptr` is a valid `Box`'d `WorkerCtx`; `rte_eal_remote_launch`
-    // takes ownership for the lifetime of the worker.
-    unsafe {
-        crate::dpdk::ffi::rte_eal_remote_launch(Some(run), ctx_ptr, lcore);
+    // SAFETY: `ctx_ptr` is a valid `Box`'d `WorkerCtx`; on success
+    // `rte_eal_remote_launch` takes ownership for the lifetime of the worker.
+    let rc = unsafe { crate::dpdk::ffi::rte_eal_remote_launch(Some(run), ctx_ptr, lcore) };
+    if rc != 0 {
+        // SAFETY: launch failed, so the box was never handed off — reclaim it
+        // here to drop the `Arc<AppCtx>` ref and free the heap allocation.
+        drop(unsafe { Box::from_raw(ctx_ptr as *mut WorkerCtx) });
+        Err(rc)
+    } else {
+        Ok(())
     }
 }
 
