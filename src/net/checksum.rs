@@ -63,6 +63,29 @@ pub fn udp_ipv4(src: [u8; 4], dst: [u8; 4], udp: &[u8]) -> u16 {
     }
 }
 
+/// Recompute a checksum after a field changes, per RFC 1624:
+/// `HC' = ~(~HC + ~m + m')`, where `m`/`m'` are the old/new field bytes
+/// (equal length, big-endian 16-bit words).
+///
+/// Apply once per independent field. A change that affects two checksums (e.g.
+/// an IPv4 address lives in both the IP header checksum and the L4 pseudo-
+/// header) needs one call per checksum. Chaining is fine: feed the result back
+/// in for a second field. (For a UDP checksum, remember a computed 0 must be
+/// stored as `0xFFFF`.)
+pub fn update(checksum: u16, old: &[u8], new: &[u8]) -> u16 {
+    // acc = ~HC + sum(~old words) + sum(new words)
+    let mut acc = (!checksum) as u32;
+    let mut chunks = old.chunks_exact(2);
+    for c in &mut chunks {
+        acc = acc.wrapping_add((!u16::from_be_bytes([c[0], c[1]])) as u32);
+    }
+    if let [b] = chunks.remainder() {
+        acc = acc.wrapping_add((!u16::from_be_bytes([*b, 0])) as u32);
+    }
+    acc = accumulate(acc, new);
+    !fold(acc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +121,26 @@ mod tests {
         acc = acc.wrapping_add(udp.len() as u32);
         acc = accumulate(acc, &udp);
         assert_eq!(finish(acc), 0);
+    }
+
+    #[test]
+    fn incremental_update_matches_full_recompute() {
+        let mut hdr = [
+            0x45, 0x00, 0x00, 0x3c, 0x1c, 0x46, 0x40, 0x00, 0x40, 0x06, 0x00, 0x00, 0xac, 0x10,
+            0x0a, 0x63, 0xac, 0x10, 0x0a, 0x0c,
+        ];
+        let stored = ipv4_header(&hdr);
+        hdr[10..12].copy_from_slice(&stored.to_be_bytes());
+        assert_eq!(checksum(&hdr), 0);
+
+        // Rewrite the source address (bytes 12..16) NAT-style.
+        let old_src = [hdr[12], hdr[13], hdr[14], hdr[15]];
+        let new_src = [203, 0, 113, 7];
+        let updated = update(stored, &old_src, &new_src);
+
+        // Full recompute over the modified header must agree.
+        hdr[12..16].copy_from_slice(&new_src);
+        hdr[10..12].copy_from_slice(&[0, 0]);
+        assert_eq!(updated, ipv4_header(&hdr));
     }
 }

@@ -18,22 +18,25 @@ fn main() {
 
 #[cfg(feature = "dpdk")]
 mod runtime {
-    use quicktcp::dpdk::ffi;
+    use quicktcp::dpdk::lcore::LcoreIter;
     use quicktcp::dpdk::mbuf::Mbuf;
-    use quicktcp::dpdk::port::{self, PortConfig};
-    use quicktcp::net::ethernet::MacAddr;
+    use quicktcp::dpdk::mempool::{MemPool, SharedMemPool};
+    use quicktcp::dpdk::port::{self, Port, PortConfig};
+    use quicktcp::dpdk::{self, ffi};
+    use quicktcp::router::app::{self, AppCtx, LanPortCtx, PortCtx, WanPortCtx, launch_worker};
     use quicktcp::router::conf::{InterfaceRole, RouterConfig};
-    use quicktcp::router::{
-        arp,
-        dhcp::{DhcpClient, DhcpServer, DhcpServerConfig},
-    };
+    use quicktcp::router::dhcp::{DhcpClient, DhcpServer, DhcpServerConfig, SharedDhcpClient};
+    use quicktcp::router::fdb::SharedFdb;
+    use quicktcp::router::leases::SharedLeases;
+    use quicktcp::router::neighbor::SharedNeighbor;
+    use quicktcp::router::pool::SharedAddressPool;
+    use std::collections::BTreeMap;
     use std::ffi::CString;
     use std::io::Read;
     use std::net::Ipv4Addr;
     use std::path::Path;
+    use std::sync::Arc;
 
-    /// RX/TX burst size.
-    const BURST: usize = 32;
     /// Per-port RX/TX descriptor ring size.
     const RING: u16 = 1024;
     /// Number of mbufs in the pool (a Mersenne prime, per DPDK convention).
@@ -42,10 +45,8 @@ mod runtime {
     const MBUF_CACHE: u32 = 256;
     /// mbuf data room: default 2048 payload + 128 headroom.
     const MBUF_DATA_ROOM: u16 = 2048 + 128;
-    /// Max Ethernet frame we build into the scratch buffer.
-    const FRAME_MAX: usize = 1518;
 
-    /// Software-defined DHCP server identity / LAN gateway.
+    /// LAN DHCP lease length handed out by the server.
     const LEASE_SECS: u32 = 86_400;
     /// Transaction id seed for the WAN client ("quic" in ASCII).
     const WAN_XID: u32 = 0x7175_6963;
@@ -71,31 +72,15 @@ mod runtime {
 
         eal_init();
 
-        let ports = port::all_ports();
-        assert!(
-            ports.len() >= 2,
-            "need at least one WAN + one LAN port (found {})",
-            ports.len()
-        );
         // Find the WAN port based on the config.
         let wan_port_name = config
             .interfaces
             .iter()
             .find(|i| i.role == InterfaceRole::Wan)
             .map(|i| i.name.clone())
-            .unwrap_or_else(|| ports[0].to_string());
+            .expect("WAN port not configured");
 
-        let mut wan = 0;
-
-        unsafe {
-            let c_str = CString::new(wan_port_name.clone()).unwrap();
-            let ret = ffi::rte_eth_dev_get_port_by_name(c_str.as_ptr(), &mut wan);
-            assert_eq!(
-                ret, 0,
-                "failed to find WAN port with name '{}'",
-                wan_port_name
-            );
-        }
+        let wan_id = get_port_id(&wan_port_name);
 
         let lan_port_names = config
             .interfaces
@@ -104,121 +89,219 @@ mod runtime {
             .map(|i| i.name.clone())
             .collect::<Vec<_>>();
 
-        let mut lan_ports = vec![0; lan_port_names.len()];
-        for (i, lan_port_name) in lan_port_names.into_iter().enumerate() {
-            unsafe {
-                let c_str = CString::new(lan_port_name.clone()).unwrap();
-                let ret = ffi::rte_eth_dev_get_port_by_name(c_str.as_ptr(), &mut lan_ports[i]);
-                assert_eq!(
-                    ret, 0,
-                    "failed to find LAN port with name '{}'",
-                    lan_port_name
-                );
-            }
-        }
+        let lan_ids = lan_port_names
+            .iter()
+            .map(|name| get_port_id(name.as_str()))
+            .collect::<Vec<_>>();
 
-        let pool = create_pool();
-        for &p in &ports {
-            port::init_port(&PortConfig {
+        assert!(
+            lan_ids.iter().all(|&id| id != wan_id),
+            "WAN port must be distinct from LAN ports"
+        );
+
+        assert!(!lan_ids.is_empty(), "at least one LAN port required");
+
+        let port_ids = std::iter::once(wan_id)
+            .chain(lan_ids.iter().copied())
+            .collect::<Vec<_>>();
+
+        // SAFETY: we're still single-core at this point, so there's no concurrency to worry about yet.
+        let main_lcore = unsafe { ffi::rte_get_main_lcore() };
+
+        // Filter to only enabled lcores and worker lcores
+        let lcores = LcoreIter::new()
+            .filter(|lcore| unsafe { ffi::rte_lcore_is_enabled(lcore.id) } != 0)
+            .collect::<Vec<_>>();
+
+        let nb_lcores = lcores.len() as u16;
+
+        let mut socket_pools: BTreeMap<i32, SharedMemPool> = BTreeMap::new();
+
+        let mut ports: BTreeMap<u16, Port> = BTreeMap::new();
+
+        let mut load: BTreeMap<u32, usize> = lcores.iter().map(|lcore| (lcore.id, 0)).collect();
+
+        // One mempool per NUMA socket touched by any port. DPDK's per-lcore
+        // cache inside each pool already gives us per-core hot stashes, so we
+        // don't need (or want) per-core pools — only per-socket placement.
+        for &p in &port_ids {
+            // Virtio etc. return -1 (SOCKET_ID_ANY); normalise to socket 0.
+            let socket = unsafe { ffi::rte_eth_dev_socket_id(p) }.max(0);
+            let pool = socket_pools
+                .entry(socket)
+                .or_insert_with(|| {
+                    SharedMemPool::from(
+                        MemPool::create(
+                            &format!("MEMPOOL{}", socket),
+                            NUM_MBUFS,
+                            MBUF_CACHE,
+                            MBUF_DATA_ROOM,
+                            socket,
+                        )
+                        .expect("failed to create mempool"),
+                    )
+                })
+                .clone();
+
+            let port_setup = port::init_port(&PortConfig {
                 port_id: p,
-                nb_rx_queues: 1,
-                nb_tx_queues: 1,
+                nb_rx_queues: nb_lcores,
+                nb_tx_queues: nb_lcores,
                 rx_ring_size: RING,
                 tx_ring_size: RING,
-                mempool: pool,
+                mempool: pool.clone(),
             })
             .expect("port init");
+
+            // Filter to lcores dedicated to this worker
+            let mut dedicated_lcores = lcores
+                .iter()
+                .filter(|lcore| lcore.socket as i32 == socket)
+                .map(|lcore| lcore.id)
+                .collect::<Vec<_>>();
+
+            // If there are no lcores that share a NUMA socket with this port, we choose
+            // the lcore with the least load as the lcore assigned to this port
+            if dedicated_lcores.is_empty() {
+                let (lcore, lcore_load) = load
+                    .iter_mut()
+                    .min_by_key(|(_, l)| **l)
+                    .expect("map is non-empty");
+                *lcore_load += 1;
+                dedicated_lcores.push(*lcore);
+            }
+
+            let port_info = dpdk::port::info(p).expect("failed to get port info");
+
+            let port = Port::new(port_setup, port_info, pool, &dedicated_lcores);
+            ports.insert(p, port);
         }
 
         // WAN DHCP client.
-        let wan_mac = mac_of(wan);
-        let mut client = DhcpClient::new(wan_mac, WAN_XID);
+        let wan_port = ports.remove(&wan_id).expect("WAN port could not be found");
+        let wan_mac = wan_port.info().ether_addr;
+        let dhcp_client = SharedDhcpClient::from(DhcpClient::new(wan_mac, WAN_XID));
+        // Shared neighbor table for the WAN segment (cloneable handle so each
+        // future worker can hold its own reference to the same state). The
+        // address starts unspecified; it's updated when the WAN DHCP lease
+        // binds, below.
+        let wan_neighbor: SharedNeighbor<Mbuf> =
+            SharedNeighbor::new(wan_mac, Ipv4Addr::UNSPECIFIED);
+        let wan_ctx = PortCtx::Wan(WanPortCtx::new(wan_port, wan_neighbor, dhcp_client));
+
+        let address_pool = SharedAddressPool::new(pool_start, pool_end);
+        // Reserve the server IP for ourselves so it doesn't get leased out. It may not be
+        // in the pool but that's okay this is just a safety precaution.
+        address_pool.reserve(server_ip);
+
+        // One shared lease table across every LAN port: this is a bridged LAN
+        // (one broadcast domain), so a client roaming between physical ports
+        // must keep its lease. Each per-port `DhcpServer` clones this handle
+        // and reads/writes the same bindings.
+        let leases = SharedLeases::new();
 
         // One DHCP server per LAN port, each sourcing replies from that port's
-        // own MAC but sharing the single service IP. (For a bridged LAN you'd
-        // share one lease pool instead of one-per-port.)
-        let mut lan: Vec<(u16, MacAddr, DhcpServer)> = lan_ports
-            .iter()
-            .map(|&p| {
-                let mac = mac_of(p);
-                let server = DhcpServer::new(DhcpServerConfig {
-                    server_ip,
-                    server_mac: mac,
-                    gateway: server_ip,
-                    subnet_mask: subnet_mask.netmask(),
-                    // advertise ourselves as the DNS server in addition to the upstream
-                    // configured ones; this way clients get DNS resolution as soon as they have a lease.
-                    dns: std::iter::once(server_ip)
-                        .chain(config.dns.servers.clone())
-                        .collect(),
-                    lease_secs: LEASE_SECS,
-                    pool_start,
-                    pool_end,
-                });
-                (p, mac, server)
+        // own MAC but sharing the single service IP, address pool, and lease
+        // table.
+        //
+        // `SharedNeighbor` is `Clone` so additional workers serving the same
+        // LAN segment can hold their own handle to the same cache + pending
+        // queue; today the runtime is single-core, but the wiring is forward-
+        // compatible.
+        let software_defined_addr = quicktcp::net::util::software_defined_mac(server_ip);
+        let lan_neighbor = SharedNeighbor::<Mbuf>::new(software_defined_addr, server_ip);
+
+        let lan: Vec<PortCtx> = ports
+            .into_values()
+            .map(|port| {
+                let server = DhcpServer::new(
+                    DhcpServerConfig {
+                        server_ip,
+                        server_mac: software_defined_addr,
+                        gateway: server_ip,
+                        subnet_mask: subnet_mask.netmask(),
+                        // advertise ourselves as the DNS server in addition to the upstream
+                        // configured ones; this way clients get DNS resolution as soon as they have a lease.
+                        dns: std::iter::once(server_ip)
+                            .chain(config.dns.servers.clone())
+                            .collect(),
+                        lease_secs: LEASE_SECS,
+                    },
+                    address_pool.clone(),
+                    leases.clone(),
+                );
+                PortCtx::Lan(LanPortCtx::new(port, lan_neighbor.clone(), server))
             })
             .collect();
 
-        let mut scratch = [0u8; FRAME_MAX];
+        let port_ctx = std::iter::once(wan_ctx)
+            .chain(lan.into_iter())
+            .collect::<Vec<_>>();
 
-        // Kick off the WAN client (sends DISCOVER).
-        if let Some(n) = client.poll(&mut scratch) {
-            tx(wan, pool, &scratch[..n]);
-        }
+        // FDB table for forwarding within the LAN segment
+        let fdb = SharedFdb::<Mbuf>::new(128);
 
-        let mut last_bound: Option<Ipv4Addr> = None;
-        loop {
-            // ---- WAN: drive the DHCP client ----
-            for raw in rx_burst(wan) {
-                // SAFETY: `raw` is a valid mbuf handed over by rx_burst.
-                let Some(m) = (unsafe { Mbuf::from_raw(raw) }) else {
-                    continue;
-                };
-                if let Some(dhcp) = m
-                    .ethernet()
-                    .and_then(|e| e.ipv4())
-                    .and_then(|i| i.udp())
-                    .and_then(|u| u.dhcp())
-                {
-                    client.on_receive(&dhcp);
-                }
-                // m dropped here -> mbuf freed.
-            }
-            // Advance the client (sends REQUEST after an OFFER).
-            if client.bound_ip().is_none() {
-                if let Some(n) = client.poll(&mut scratch) {
-                    tx(wan, pool, &scratch[..n]);
-                }
-            } else if client.bound_ip() != last_bound {
-                last_bound = client.bound_ip();
-                println!("WAN address acquired: {}", last_bound.unwrap());
-            }
+        let ctx = Arc::new(AppCtx::new(server_ip, software_defined_addr, fdb, port_ctx));
 
-            // ---- LAN: ARP + DHCP server ----
-            for (p, mac, server) in lan.iter_mut() {
-                for raw in rx_burst(*p) {
-                    let Some(m) = (unsafe { Mbuf::from_raw(raw) }) else {
-                        continue;
-                    };
-                    let data = m.data();
+        // Handle CTRL-C gracefully so we can stop ports and run rte_eal_cleanup
+        // instead of being killed by the default signal handler mid-burst.
+        app::setup_sigint_handler();
 
-                    // ARP request for the service IP?
-                    if let Some(n) = arp::respond(*mac, &[server_ip], data, &mut scratch) {
-                        tx(*p, pool, &scratch[..n]);
-                        continue;
-                    }
-                    // DHCP request?
-                    if let Some(dhcp) = quicktcp::net::view::parse(data)
-                        .and_then(|e| e.ipv4())
-                        .and_then(|i| i.udp())
-                        .and_then(|u| u.dhcp())
-                        && let Some(n) = server.handle(&dhcp, &mut scratch)
-                    {
-                        tx(*p, pool, &scratch[..n]);
-                    }
-                }
+        for lcore in &lcores {
+            if lcore.id != main_lcore {
+                // SAFETY: every worker holds its own `Arc<AppCtx>`; all interior
+                // state shared with the main thread is behind locks or atomics
+                // (`SharedNeighbor`, `SharedFdb`, `SharedDhcpClient`, the per-TX
+                // queue spinlocks on `Port`, `WanPortCtx::bound`), and the
+                // per-lcore RX-queue assignment guarantees no two lcores poll
+                // the same hardware queue.
+                let ctx = Arc::clone(&ctx);
+                launch_worker(lcore.id, ctx);
             }
         }
+
+        // The main lcore is itself a worker. It returns once SHUTDOWN is set.
+        ctx.run(main_lcore);
+
+        // Wait for every other lcore to exit its poll loop before tearing the
+        // EAL down — workers may still be holding `Mbuf`s that must drop back
+        // into their mempool before `rte_eal_cleanup` runs.
+        for lcore in &lcores {
+            if lcore.id != main_lcore {
+                // SAFETY: `rte_eal_wait_lcore` blocks until the worker returns.
+                unsafe { ffi::rte_eal_wait_lcore(lcore.id) };
+            }
+        }
+
+        // Stop and close every port before cleanup so the NIC stops DMA'ing
+        // into mbufs we're about to free. Errors here are non-fatal — we still
+        // want to attempt cleanup.
+        for &p in &port_ids {
+            // SAFETY: ports were configured + started in this same process;
+            // both calls are no-ops if the port is already stopped/closed.
+            let rc = unsafe { ffi::rte_eth_dev_stop(p) };
+            if rc < 0 {
+                eprintln!("[WARN]: rte_eth_dev_stop(port={p}) failed: {rc}");
+            }
+            let rc = unsafe { ffi::rte_eth_dev_close(p) };
+            if rc < 0 {
+                eprintln!("[WARN]: rte_eth_dev_close(port={p}) failed: {rc}");
+            }
+        }
+
+        if unsafe { ffi::rte_eal_cleanup() } != 0 {
+            eprintln!("rte_eal_cleanup failed");
+        }
+    }
+
+    fn get_port_id(name: &str) -> u16 {
+        let mut port_id = 0;
+        unsafe {
+            let c_str = CString::new(name.to_string()).unwrap();
+            let ret = ffi::rte_eth_dev_get_port_by_name(c_str.as_ptr(), &mut port_id);
+            assert_eq!(ret, 0, "failed to find port with name '{}'", name);
+        }
+        port_id
     }
 
     /// Initialise EAL from this process's argv.
@@ -231,59 +314,5 @@ mod runtime {
         // SAFETY: argc/argv are a valid vector outliving the call.
         let rc = unsafe { ffi::rte_eal_init(argv.len() as core::ffi::c_int, argv.as_mut_ptr()) };
         assert!(rc >= 0, "rte_eal_init failed: {rc}");
-    }
-
-    fn create_pool() -> *mut ffi::rte_mempool {
-        let name = CString::new("mbuf_pool").unwrap();
-        // SAFETY: valid name; standard pktmbuf pool parameters.
-        let pool = unsafe {
-            ffi::rte_pktmbuf_pool_create(
-                name.as_ptr(),
-                NUM_MBUFS,
-                MBUF_CACHE,
-                0,
-                MBUF_DATA_ROOM,
-                ffi::rte_socket_id() as core::ffi::c_int,
-            )
-        };
-        assert!(!pool.is_null(), "rte_pktmbuf_pool_create failed");
-        pool
-    }
-
-    fn mac_of(port: u16) -> MacAddr {
-        // SAFETY: zeroed addr struct is filled by the call; port is valid.
-        let mut addr: ffi::rte_ether_addr = unsafe { core::mem::zeroed() };
-        unsafe { ffi::rte_eth_macaddr_get(port, &mut addr) };
-        addr.addr_bytes
-    }
-
-    /// Receive a burst, returning the raw mbuf pointers (wrap each in `Mbuf`).
-    fn rx_burst(port: u16) -> impl Iterator<Item = *mut ffi::rte_mbuf> {
-        let mut bufs = [core::ptr::null_mut(); BURST];
-        // SAFETY: `bufs` has room for `BURST` pointers.
-        let n = unsafe { ffi::rte_eth_rx_burst(port, 0, bufs.as_mut_ptr(), BURST as u16) } as usize;
-        bufs.into_iter().take(n)
-    }
-
-    /// Allocate an mbuf, copy `frame` into it, and transmit on `port` queue 0.
-    fn tx(port: u16, pool: *mut ffi::rte_mempool, frame: &[u8]) {
-        // SAFETY: `pool` is a live mbuf pool; `append`'d bytes are written
-        // before transmit; on failure we reclaim the mbuf so it isn't leaked.
-        unsafe {
-            let Some(mut m) = Mbuf::alloc(pool) else {
-                return;
-            };
-            let Some(dst) = m.append(frame.len() as u16) else {
-                return; // no tailroom
-            };
-            dst.copy_from_slice(frame);
-
-            let mut raw = m.into_raw();
-            let sent = ffi::rte_eth_tx_burst(port, 0, &mut raw, 1);
-            if sent == 0 {
-                // Not transmitted: take ownership back so Drop frees it.
-                let _ = Mbuf::from_raw(raw);
-            }
-        }
     }
 }

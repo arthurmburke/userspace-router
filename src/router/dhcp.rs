@@ -7,13 +7,16 @@
 //! ([`DhcpServerConfig::server_ip`]) used as the DHCP server-id on every LAN
 //! interface.
 
+use crate::core::spinlock::RwSpinLock;
 use crate::net::dhcp::{self, DhcpHeader, MessageType, OptionsWriter, option};
 use crate::net::ethernet::{BROADCAST, MacAddr};
 use crate::net::view::DhcpView;
 use crate::net::wire::mut_from_prefix;
 use crate::router::frame::{self, UdpV4};
-use std::collections::HashMap;
+use crate::router::leases::SharedLeases;
+use crate::router::pool::SharedAddressPool;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 /// Server (BOOTP server) UDP port.
 const SERVER_PORT: u16 = 67;
@@ -55,33 +58,53 @@ pub struct DhcpServerConfig {
     pub subnet_mask: Ipv4Addr,
     pub dns: Vec<Ipv4Addr>,
     pub lease_secs: u32,
-    /// Inclusive address pool.
-    pub pool_start: Ipv4Addr,
-    pub pool_end: Ipv4Addr,
 }
 
-/// A simple DHCP server with a flat address pool keyed by client MAC.
+/// A simple DHCP server. The [`SharedAddressPool`] and [`SharedLeases`] are
+/// `Clone`-able handles to state behind spinlocks; multiple [`DhcpServer`]
+/// instances (one per LAN port) sharing the same handles act as a single
+/// bridged server — a client roaming between ports keeps its lease.
 pub struct DhcpServer {
     cfg: DhcpServerConfig,
-    leases: HashMap<MacAddr, Ipv4Addr>,
+    pool: SharedAddressPool,
+    leases: SharedLeases,
 }
 
 impl DhcpServer {
-    pub fn new(cfg: DhcpServerConfig) -> Self {
-        Self {
-            cfg,
-            leases: HashMap::new(),
-        }
+    pub fn new(cfg: DhcpServerConfig, pool: SharedAddressPool, leases: SharedLeases) -> Self {
+        Self { cfg, pool, leases }
     }
 
-    /// Currently-assigned address for `mac`, if any.
+    /// Reserve an IP, preventing it from being leased out. Useful if a host on the LAN
+    /// is using a static IP address.
+    pub fn reserve(&self, ip: Ipv4Addr) {
+        self.pool.reserve(ip);
+    }
+
+    /// Release an IP back to the pool, as is the case when a host changed its static IP.
+    pub fn release(&self, ip: Ipv4Addr) {
+        self.pool.release(ip);
+    }
+
+    /// Start of the DHCP range
+    pub fn start(&self) -> Ipv4Addr {
+        self.pool.start()
+    }
+
+    /// End of DHCP range
+    pub fn end(&self) -> Ipv4Addr {
+        self.pool.end()
+    }
+
+    /// Currently-assigned address for `mac`, if any. Reads the shared table —
+    /// any peer server in the bridged set sees the same answer.
     pub fn lease_of(&self, mac: &MacAddr) -> Option<Ipv4Addr> {
-        self.leases.get(mac).copied()
+        self.leases.lookup(*mac)
     }
 
     /// Process an inbound DHCP message and, if a reply is warranted, build the
     /// response frame into `out`, returning its length.
-    pub fn handle(&mut self, view: &DhcpView, out: &mut [u8]) -> Option<usize> {
+    pub fn handle(&self, view: &DhcpView, out: &mut [u8]) -> Option<usize> {
         let header = view.header();
         let mac = client_mac(header);
         let xid = header.xid();
@@ -110,7 +133,11 @@ impl DhcpServer {
                 }
             }
             MessageType::Release | MessageType::Decline => {
-                self.leases.remove(&mac);
+                // Return the address to the pool so it can be re-leased.
+                // Without this the pool would leak one address per release.
+                if let Some(ip) = self.leases.remove(mac) {
+                    self.pool.release(ip);
+                }
                 None
             }
             _ => None,
@@ -118,24 +145,20 @@ impl DhcpServer {
     }
 
     /// Return the address bound to `mac`, allocating the next free pool address
-    /// on first contact.
-    fn assign(&mut self, mac: MacAddr) -> Option<Ipv4Addr> {
-        if let Some(&ip) = self.leases.get(&mac) {
+    /// on first contact. Subsequent calls for the same MAC are idempotent —
+    /// they return the same IP they took the first time. This is what makes
+    /// DISCOVER → OFFER → REQUEST → ACK work: the IP offered to a client must
+    /// match the IP we still hold for it when REQUEST arrives.
+    fn assign(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+        if let Some(ip) = self.leases.lookup(mac) {
             return Some(ip);
         }
-        let taken: std::collections::HashSet<u32> =
-            self.leases.values().map(|a| u32::from(*a)).collect();
-        let reserved = [u32::from(self.cfg.server_ip), u32::from(self.cfg.gateway)];
-
-        for n in u32::from(self.cfg.pool_start)..=u32::from(self.cfg.pool_end) {
-            if reserved.contains(&n) || taken.contains(&n) {
-                continue;
-            }
-            let ip = Ipv4Addr::from(n);
-            self.leases.insert(mac, ip);
-            return Some(ip);
-        }
-        None // pool exhausted
+        // First contact: take from the pool and record the binding so the
+        // matching REQUEST reaches the same address — including REQUESTs that
+        // land on a sibling server sharing the same lease table.
+        let ip = self.pool.take(1)?.into_iter().next()?;
+        self.leases.insert(mac, ip);
+        Some(ip)
     }
 
     fn build_reply(
@@ -346,6 +369,42 @@ impl DhcpClient {
     }
 }
 
+/// A shared implementation of the DHCP client that can be used across workers
+#[derive(Clone)]
+pub struct SharedDhcpClient {
+    inner: Arc<RwSpinLock<DhcpClient>>,
+}
+
+impl From<DhcpClient> for SharedDhcpClient {
+    fn from(value: DhcpClient) -> Self {
+        Self {
+            inner: Arc::new(RwSpinLock::new(value)),
+        }
+    }
+}
+
+impl SharedDhcpClient {
+    pub fn state(&self) -> ClientState {
+        self.inner.with_read(|inner| inner.state())
+    }
+
+    pub fn lease(&self) -> Option<DhcpLease> {
+        self.inner.with_read(|inner| inner.lease().cloned())
+    }
+
+    pub fn bound_ip(&self) -> Option<Ipv4Addr> {
+        self.inner.with_read(|inner| inner.bound_ip())
+    }
+
+    pub fn poll(&self, out: &mut [u8]) -> Option<usize> {
+        self.inner.with_write(|inner| inner.poll(out))
+    }
+
+    pub fn on_receive(&self, view: &DhcpView) {
+        self.inner.with_write(|inner| inner.on_receive(view))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,17 +426,25 @@ mod tests {
         let server_mac = [0x02, 0, 0, 0, 0, 0x01];
         let server_ip = Ipv4Addr::new(192, 168, 1, 1);
 
+        let pool = SharedAddressPool::new(
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 110),
+        );
+        pool.reserve(server_ip);
+
         let mut client = DhcpClient::new(client_mac, 0xABCD_1234);
-        let mut server = DhcpServer::new(DhcpServerConfig {
-            server_ip,
-            server_mac,
-            gateway: server_ip,
-            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
-            dns: vec![Ipv4Addr::new(1, 1, 1, 1)],
-            lease_secs: 3600,
-            pool_start: Ipv4Addr::new(192, 168, 1, 100),
-            pool_end: Ipv4Addr::new(192, 168, 1, 110),
-        });
+        let mut server = DhcpServer::new(
+            DhcpServerConfig {
+                server_ip,
+                server_mac,
+                gateway: server_ip,
+                subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                dns: vec![Ipv4Addr::new(1, 1, 1, 1)],
+                lease_secs: 3600,
+            },
+            pool,
+            crate::router::leases::SharedLeases::new(),
+        );
 
         let mut out = [0u8; 600];
         let mut reply = [0u8; 600];
@@ -409,16 +476,18 @@ mod tests {
     #[test]
     fn distinct_clients_get_distinct_addresses() {
         let server_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let mut server = DhcpServer::new(DhcpServerConfig {
-            server_ip,
-            server_mac: [0x02, 0, 0, 0, 0, 1],
-            gateway: server_ip,
-            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
-            dns: vec![],
-            lease_secs: 600,
-            pool_start: Ipv4Addr::new(10, 0, 0, 10),
-            pool_end: Ipv4Addr::new(10, 0, 0, 12),
-        });
+        let mut server = DhcpServer::new(
+            DhcpServerConfig {
+                server_ip,
+                server_mac: [0x02, 0, 0, 0, 0, 1],
+                gateway: server_ip,
+                subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                dns: vec![],
+                lease_secs: 600,
+            },
+            SharedAddressPool::new(Ipv4Addr::new(10, 0, 0, 100), Ipv4Addr::new(10, 0, 0, 110)),
+            crate::router::leases::SharedLeases::new(),
+        );
 
         let mut out = [0u8; 600];
         let mut reply = [0u8; 600];
@@ -433,5 +502,64 @@ mod tests {
         offered.sort();
         offered.dedup();
         assert_eq!(offered.len(), 3, "each client should get a unique address");
+    }
+
+    /// On a bridged LAN, two physical ports each run their own `DhcpServer`
+    /// but the lease state has to be one set — a client that DISCOVERs on one
+    /// port and REQUESTs on the other (a "roam" mid-DORA) must get an ACK
+    /// for the *same* address, not a NAK or a different lease.
+    #[test]
+    fn bridged_servers_share_leases_across_a_roam() {
+        use crate::router::leases::SharedLeases;
+
+        let client_mac = [0x02, 0, 0, 0, 0, 0x10];
+        let server_ip = Ipv4Addr::new(192, 168, 1, 1);
+        let pool = SharedAddressPool::new(
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 110),
+        );
+        let leases = SharedLeases::new();
+
+        let make = |mac: MacAddr| {
+            DhcpServer::new(
+                DhcpServerConfig {
+                    server_ip,
+                    server_mac: mac,
+                    gateway: server_ip,
+                    subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                    dns: vec![],
+                    lease_secs: 600,
+                },
+                pool.clone(),
+                leases.clone(),
+            )
+        };
+        let mut server_a = make([0x02, 0, 0, 0, 0, 0x01]);
+        let mut server_b = make([0x02, 0, 0, 0, 0, 0x02]);
+
+        let mut client = DhcpClient::new(client_mac, 0xCAFE_BABE);
+        let mut out = [0u8; 600];
+        let mut reply = [0u8; 600];
+
+        // DISCOVER lands on server A — it allocates from the shared pool and
+        // records the binding in the shared lease table.
+        let n = client.poll(&mut out).unwrap();
+        let on = with_dhcp(&out[..n], |v| server_a.handle(v, &mut reply)).unwrap();
+        with_dhcp(&reply[..on], |v| client.on_receive(v));
+
+        // The client roams to the other port for its REQUEST. Server B has
+        // never seen this MAC before, but it observes the lease via
+        // `SharedLeases` and ACKs the same IP.
+        let n = client.poll(&mut out).unwrap();
+        let an = with_dhcp(&out[..n], |v| server_b.handle(v, &mut reply)).unwrap();
+        with_dhcp(&reply[..an], |v| client.on_receive(v));
+
+        assert_eq!(client.state(), ClientState::Bound);
+        let ip = client.bound_ip().unwrap();
+        // Both servers see the same binding.
+        assert_eq!(server_a.lease_of(&client_mac), Some(ip));
+        assert_eq!(server_b.lease_of(&client_mac), Some(ip));
+        // And only one address came out of the pool.
+        assert_eq!(leases.len(), 1);
     }
 }

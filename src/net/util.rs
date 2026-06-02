@@ -1,6 +1,8 @@
+use serde::{Deserialize, Serialize, Serializer};
+use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 
-use serde::{Deserialize, Serialize, Serializer};
+use crate::net::ethernet::MacAddr;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub struct Netmask(Ipv4Addr);
@@ -74,4 +76,30 @@ pub fn netmask_to_prefix(netmask: Ipv4Addr) -> Option<u8> {
         return None;
     }
     Some(mask.count_ones() as u8)
+}
+
+/// Generate a software defined locally administed MAC address from an IP address, for use in ARP replies when we don't have a real MAC to reply with.
+pub fn software_defined_mac(ip: Ipv4Addr) -> MacAddr {
+    let mut hasher = Sha256::new();
+    hasher.update(ip.to_string().as_bytes());
+
+    let hash = hasher.finalize();
+
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&hash[..6]);
+
+    // Set locally administered bit (bit 1)
+    mac[0] |= 0x02;
+
+    // Clear multicast bit (bit 0)
+    mac[0] &= 0xFE;
+
+    mac
+}
+
+pub fn format_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }

@@ -5,6 +5,13 @@ use crate::net::wire::{Pod, U16Be};
 /// A 48-bit MAC address.
 pub type MacAddr = [u8; 6];
 
+pub fn display_mac(mac: &MacAddr) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
+}
+
 /// All-ones destination MAC: the Ethernet broadcast address.
 pub const BROADCAST: MacAddr = [0xff; 6];
 
