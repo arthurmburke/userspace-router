@@ -1,0 +1,10 @@
+<!--
+  ur-lan2: isolated L2 between the router's second LAN port and leaf2.
+  Bridged with ur-lan1 inside the router (FDB-based). No libvirt-side DHCP —
+  the router serves DHCP from inside.
+-->
+<network>
+  <name>ur-lan2</name>
+  <bridge name='ur-lan20' stp='off' delay='0'/>
+  <mtu size='1500'/>
+</network>

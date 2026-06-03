@@ -1,0 +1,76 @@
+<!--
+  leaf2: kernel DHCP client on ur-lan2. Gets its IP from the router (same
+  bridged broadcast domain as leaf1, so they should see each other through
+  the router's FDB).
+-->
+<domain type='kvm'>
+  <name>ur-leaf2</name>
+  <memory unit='MiB'>768</memory>
+  <currentMemory unit='MiB'>768</currentMemory>
+  <vcpu placement='static'>1</vcpu>
+
+  <os>
+    <type arch='x86_64' machine='pc-i440fx-noble'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+
+  <features>
+    <acpi/>
+    <apic/>
+  </features>
+
+  <cpu mode='host-passthrough' check='none'/>
+
+  <clock offset='utc'>
+    <timer name='rtc' tickpolicy='catchup'/>
+    <timer name='pit' tickpolicy='delay'/>
+    <timer name='hpet' present='no'/>
+  </clock>
+
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+
+  <devices>
+    <emulator>/usr/bin/qemu-system-x86_64</emulator>
+
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2' discard='unmap'/>
+      <source file='${DISK}'/>
+      <target dev='vda' bus='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x06' function='0x0'/>
+    </disk>
+
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='${SEED}'/>
+      <target dev='sda' bus='sata'/>
+      <readonly/>
+    </disk>
+
+    <interface type='network'>
+      <source network='default'/>
+      <model type='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x02' function='0x0'/>
+    </interface>
+
+    <interface type='network'>
+      <source network='ur-lan2'/>
+      <model type='virtio'/>
+      <address type='pci' domain='0x0000' bus='0x00' slot='0x03' function='0x0'/>
+    </interface>
+
+    <serial type='pty'>
+      <target type='isa-serial' port='0'/>
+    </serial>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+
+    <graphics type='vnc' port='-1' autoport='yes'/>
+    <memballoon model='virtio'/>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+  </devices>
+</domain>

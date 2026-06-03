@@ -1,0 +1,69 @@
+#cloud-config
+# ur-upstream — runs dnsmasq as the WAN-side DHCP / DNS server.
+hostname: ur-upstream
+fqdn: ur-upstream.local
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: ubuntu
+    ssh_authorized_keys: [__SSH_AUTHORIZED_KEYS__]
+
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list:
+    - ubuntu:ubuntu
+
+package_update: true
+package_upgrade: false
+packages:
+  - dnsmasq
+  - iproute2
+  - tcpdump
+  - avahi-daemon
+
+write_files:
+  # dnsmasq config: pin to the WAN interface only, hand out 10.213.202.10-30.
+  - path: /etc/dnsmasq.d/wan.conf
+    permissions: '0644'
+    content: |
+      # WAN-side DHCP + DNS server for the userspace_router dev topology.
+      interface=enp0s3
+      bind-interfaces
+      listen-address=10.213.202.1
+      # /27 = 30 usable; reserve .1 for ourselves, hand out .10 -> .30
+      dhcp-range=10.213.202.10,10.213.202.30,255.255.255.224,12h
+      dhcp-option=option:router,10.213.202.1
+      dhcp-option=option:dns-server,10.213.202.1
+      # Forward unknown DNS to the host (mgmt iface gets a resolver via DHCP).
+      no-resolv
+      server=1.1.1.1
+      server=8.8.8.8
+      log-dhcp
+      log-queries
+      domain-needed
+      bogus-priv
+
+  # Static IP on the WAN-network interface. The mgmt interface (enp0s2) is
+  # left to the default cloud-init netplan, which DHCPs from libvirt's
+  # default network — that's how you SSH in.
+  - path: /etc/netplan/60-wan.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          enp0s3:
+            addresses: [10.213.202.1/27]
+            link-local: []
+
+runcmd:
+  - chmod 600 /etc/netplan/60-wan.yaml
+  - netplan apply
+  - systemctl enable --now dnsmasq
+  - systemctl restart dnsmasq

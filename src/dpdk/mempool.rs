@@ -91,8 +91,8 @@ impl SharedMemPool {
         self.inner.with(|inner| unsafe { inner.alloc() })
     }
 
-    /// # SAFETY only call this function on initializing a port. For all other cases when allocating Mbuf's,
-    /// use the `alloc` function. The returned pointer is not thread-safe and lifetime is not guaranteed.
+    /// Use the `alloc` function. The returned pointer is not thread-safe and lifetime is not guaranteed.
+    /// SAFETY: only call this function on initializing a port. For all other cases when allocating Mbuf's,
     pub unsafe fn raw_ptr(&self) -> *mut super::ffi::rte_mempool {
         let mut lock = self.inner.lock();
         lock.as_mut().pool.as_ptr()

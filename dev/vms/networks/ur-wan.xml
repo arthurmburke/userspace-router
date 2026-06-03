@@ -1,0 +1,12 @@
+<!--
+  ur-wan: isolated L2 between the upstream VM and the router's WAN port.
+
+  No `<ip>` block (we don't want libvirt running dnsmasq on this segment —
+  the upstream VM does that). No `<forward>` (segment doesn't reach the
+  host or the internet).
+-->
+<network>
+  <name>ur-wan</name>
+  <bridge name='ur-wan0' stp='off' delay='0'/>
+  <mtu size='1500'/>
+</network>

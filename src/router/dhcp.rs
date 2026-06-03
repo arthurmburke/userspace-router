@@ -466,7 +466,7 @@ mod tests {
         pool.reserve(server_ip);
 
         let mut client = DhcpClient::new(client_mac, 0xABCD_1234);
-        let mut server = DhcpServer::new(
+        let server = DhcpServer::new(
             DhcpServerConfig {
                 server_ip,
                 server_mac,
@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn distinct_clients_get_distinct_addresses() {
         let server_ip = Ipv4Addr::new(10, 0, 0, 1);
-        let mut server = DhcpServer::new(
+        let server = DhcpServer::new(
             DhcpServerConfig {
                 server_ip,
                 server_mac: [0x02, 0, 0, 0, 0, 1],
@@ -567,8 +567,8 @@ mod tests {
                 leases.clone(),
             )
         };
-        let mut server_a = make([0x02, 0, 0, 0, 0, 0x01]);
-        let mut server_b = make([0x02, 0, 0, 0, 0, 0x02]);
+        let server_a = make([0x02, 0, 0, 0, 0, 0x01]);
+        let server_b = make([0x02, 0, 0, 0, 0, 0x02]);
 
         let mut client = DhcpClient::new(client_mac, 0xCAFE_BABE);
         let mut out = [0u8; 600];

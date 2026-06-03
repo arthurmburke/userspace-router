@@ -87,6 +87,10 @@ impl SharedFdb {
     pub fn len(&self) -> usize {
         self.inner.with(|inner| inner.len())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.with(|inner| inner.is_empty())
+    }
 }
 
 impl Default for SharedFdb {

@@ -1,0 +1,169 @@
+#cloud-config
+# ur-router — DPDK userspace router. Build deps from the project's Dockerfile,
+# plus DPDK runtime prep (hugepages, vfio-pci, dpdk-devbind).
+hostname: ur-router
+fqdn: ur-router.local
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: ubuntu
+    ssh_authorized_keys: [__SSH_AUTHORIZED_KEYS__]
+
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list:
+    - ubuntu:ubuntu
+
+package_update: true
+package_upgrade: false
+packages:
+  # From the project Dockerfile.
+  - build-essential
+  - pkg-config
+  - libdpdk-dev
+  - dpdk
+  - clang
+  - libclang-dev
+  - llvm-dev
+  - libnuma-dev
+  - python3
+  - python3-pyelftools
+  - kmod
+  - pciutils
+  - iproute2
+  - ethtool
+  - ca-certificates
+  - curl
+  - git
+  - gdb
+  # Quality-of-life inside the VM.
+  - tcpdump
+  - avahi-daemon
+  - jq
+
+write_files:
+  # Router config matching the libvirt slot pinning + the WAN/LAN subnets.
+  - path: /opt/router/router.conf
+    permissions: '0644'
+    content: |
+      # Userspace router config for the dev topology.
+      # WAN  = ur-wan  (10.213.202.0/27, DHCP'd by upstream VM)
+      # LAN  = ur-lan{1,2} (172.16.172.0/24, served by this router)
+
+      [lan]
+      ip   = "172.16.172.1"
+      mask = "255.255.255.0"
+
+      [dhcp]
+      pool_start = "172.16.172.100"
+      pool_end   = "172.16.172.200"
+
+      [dns]
+      servers        = ["10.213.202.1", "1.1.1.1"]
+      search_domains = []
+      aliases        = []
+
+      [[interfaces]]
+      name = "0000:00:03.0"
+      role = "wan"
+
+      [[interfaces]]
+      name = "0000:00:04.0"
+      role = "lan"
+
+      [[interfaces]]
+      name = "0000:00:05.0"
+      role = "lan"
+
+  # Idempotent DPDK bring-up: allocates hugepages, loads vfio-pci, binds the
+  # three WAN/LAN virtio NICs. Safe to re-run; logs what changed.
+  - path: /opt/router/bind-dpdk.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      log() { printf '[bind-dpdk] %s\n' "$*"; }
+
+      # 1. Hugepages: 512 × 2 MiB = 1 GiB. Mounted at /dev/hugepages by Ubuntu.
+      want=512
+      have=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages)
+      if [[ "$have" -lt "$want" ]]; then
+        log "allocating $want 2 MiB hugepages (had $have)"
+        echo "$want" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+      else
+        log "hugepages already at $have (>= $want)"
+      fi
+      mountpoint -q /dev/hugepages || {
+        mkdir -p /dev/hugepages
+        mount -t hugetlbfs nodev /dev/hugepages
+      }
+
+      # 2. vfio-pci. Nested virt usually means no IOMMU; enable noiommu mode.
+      modprobe vfio-pci
+      echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode
+
+      # 3. Bind the three router NICs. Slot pinning in the domain XML keeps
+      #    these stable across reboots.
+      DEVS=(0000:00:03.0 0000:00:04.0 0000:00:05.0)
+      for d in "${DEVS[@]}"; do
+        drv=$(basename "$(readlink /sys/bus/pci/devices/$d/driver 2>/dev/null || echo none)")
+        if [[ "$drv" == "vfio-pci" ]]; then
+          log "$d already bound to vfio-pci"
+          continue
+        fi
+        log "binding $d to vfio-pci (was: $drv)"
+        dpdk-devbind.py --bind=vfio-pci "$d"
+      done
+
+      log "status:"
+      dpdk-devbind.py --status-dev=net | sed -n '/Network devices/,/^$/p'
+
+  # Persist hugepages + vfio mode across reboots.
+  - path: /etc/sysctl.d/99-router.conf
+    permissions: '0644'
+    content: |
+      vm.nr_hugepages = 512
+  - path: /etc/modules-load.d/vfio-pci.conf
+    permissions: '0644'
+    content: |
+      vfio-pci
+  - path: /etc/modprobe.d/vfio-pci-noiommu.conf
+    permissions: '0644'
+    content: |
+      options vfio enable_unsafe_noiommu_mode=1
+
+  # Leave the WAN + LAN NICs unmanaged by netplan so DPDK can grab them.
+  - path: /etc/netplan/60-router.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          # mgmt only — DHCPs from libvirt default network.
+          enp0s2:
+            dhcp4: true
+          # WAN and LAN are bound to vfio-pci; tell netplan to leave them.
+          enp0s3: { dhcp4: false, optional: true }
+          enp0s4: { dhcp4: false, optional: true }
+          enp0s5: { dhcp4: false, optional: true }
+
+runcmd:
+  - chmod 600 /etc/netplan/60-router.yaml
+  - netplan apply
+  - sysctl --system
+  - mkdir -p /opt/router
+  # Install Rust as the ubuntu user (so cargo is in ~/.cargo/bin).
+  - su - ubuntu -c "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt --component clippy"
+  - echo 'export LIBCLANG_PATH=/usr/lib/llvm-18/lib' >> /home/ubuntu/.bashrc
+
+# Touching grub for hugepages is optional; runtime allocation in
+# bind-dpdk.sh is enough for dev. If you ever want them at boot:
+#   sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 default_hugepagesz=2M hugepagesz=2M hugepages=512"/' /etc/default/grub
+#   sudo update-grub && sudo reboot

@@ -1,0 +1,48 @@
+#cloud-config
+# ur-leaf1 — DHCP client on ur-lan1; lease comes from the router.
+hostname: ur-leaf1
+fqdn: ur-leaf1.local
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    groups: [sudo]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: ubuntu
+    ssh_authorized_keys: [__SSH_AUTHORIZED_KEYS__]
+
+ssh_pwauth: true
+chpasswd:
+  expire: false
+  list:
+    - ubuntu:ubuntu
+
+package_update: true
+package_upgrade: false
+packages:
+  - iproute2
+  - tcpdump
+  - curl
+  - avahi-daemon
+
+write_files:
+  # Mgmt (enp0s2) stays on the default cloud-init netplan (DHCPs from libvirt
+  # default). enp0s3 is our "production" interface — DHCPs from the router
+  # over ur-lan1.
+  - path: /etc/netplan/60-lan.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          enp0s3:
+            dhcp4: true
+            dhcp4-overrides:
+              use-dns: true
+              use-routes: true
+
+runcmd:
+  - chmod 600 /etc/netplan/60-lan.yaml
+  - netplan apply

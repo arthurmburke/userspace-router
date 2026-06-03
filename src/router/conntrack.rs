@@ -245,6 +245,10 @@ impl ConnTrack {
         self.flows.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.flows.is_empty()
+    }
+
     /// Observe an outbound (LAN → WAN) TCP packet. The internal endpoint is
     /// the *sender*, the external endpoint is the *receiver*; update both
     /// per the RFC 9293 FSM. Returns the post-update `(internal, external)`
@@ -399,6 +403,10 @@ impl SharedConnTrack {
 
     pub fn len(&self) -> usize {
         self.inner.with(|c| c.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.with(|c| c.is_empty())
     }
 
     pub fn observe_egress(
