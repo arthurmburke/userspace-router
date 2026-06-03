@@ -244,12 +244,11 @@ mod runtime {
             .collect();
 
         let port_ctx = std::iter::once(wan_ctx)
-            .chain(lan.into_iter())
+            .chain(lan)
             .collect::<Vec<_>>();
 
-        // FDB: a plain MAC → port cache. Unknown unicast floods, so the FDB
-        // doesn't need to queue packets while waiting to learn a destination
-        // — the flood reaches the host.
+        // FDB: a plain MAC to port cache. Unknown unicast floods, so the FDB
+        // doesn't need to queue packets while waiting to learn a destination.
         let fdb = SharedFdb::new();
 
         // NAT table: the WAN IP starts unspecified; it's set on the first DHCP

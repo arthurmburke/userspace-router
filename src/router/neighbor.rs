@@ -19,9 +19,9 @@
 //! iteration) to retransmit unanswered requests, expire pending entries whose
 //! target never replied, and age out stale cache entries.
 
+use crate::net::arp;
 use crate::core::spinlock::RwSpinLock;
-use crate::net::arp::{self, ArpPacket};
-use crate::net::ethernet::MacAddr;
+use crate::net::ethernet::{MacAddr, MacAddrFmt};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ impl Tick {
     }
 }
 
-impl Display for Tick {
+impl std::fmt::Display for Tick {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ms", self.0)
     }
@@ -242,10 +242,10 @@ impl<P> NeighborTable<P> {
 
     pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
         writeln!(f, "ARP:")?;
-        writeln!(f, "  our_mac: {}, our_ip: {}", self.our_mac, self.our_ip)?;
+        writeln!(f, "  our_mac: {}, our_ip: {}", MacAddrFmt(&self.our_mac), self.our_ip)?;
         writeln!(f, "  cache:")?;
         for (ip, entry) in &self.cache {
-            writeln!(f, "    {} -> {} (learned at {:?})", ip, entry.mac, entry.learned_at)?;
+            writeln!(f, "    {} -> {} (learned at {:?})", ip, MacAddrFmt(&entry.mac), entry.learned_at)?;
         }
         writeln!(f, "  pending:")?;
         for (ip, pending) in &self.pending {

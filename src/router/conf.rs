@@ -55,6 +55,8 @@ pub struct Alias {
 #[serde(rename_all = "snake_case")]
 pub struct Dns {
     pub servers: Vec<Ipv4Addr>,
+    #[serde(default)]
     pub search_domains: Vec<String>,
+    #[serde(default)]
     pub aliases: Vec<Alias>,
 }

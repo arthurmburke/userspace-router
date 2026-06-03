@@ -5,6 +5,19 @@ use crate::net::wire::{Pod, U16Be};
 /// A 48-bit MAC address.
 pub type MacAddr = [u8; 6];
 
+pub struct MacAddrFmt<'a>(pub &'a MacAddr);
+
+impl<'a> std::fmt::Display for MacAddrFmt<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mac = self.0;
+        write!(
+            f,
+            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+        )
+    }
+}
+
 pub fn display_mac(mac: &MacAddr) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
