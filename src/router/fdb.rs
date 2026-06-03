@@ -1,4 +1,11 @@
-//! A forwarding database (FDB) for Ethernet frames, mapping destination MAC addresses to output ports.
+//! A forwarding database (FDB) for Ethernet frames: a plain MAC → port map.
+//!
+//! The data plane floods on a miss (unknown-unicast flood, the standard bridge
+//! behaviour), so the FDB doesn't need to queue packets while waiting to learn
+//! a destination MAC — the flood reaches it. That makes the FDB a pure cache:
+//! `insert` records `src → port` on every observed frame, and `lookup` returns
+//! the cached egress port (if any). No packet types, no pending lists, no
+//! generic parameter.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -7,71 +14,83 @@ use crate::{
     net::ethernet::{MacAddr, display_mac},
 };
 
-enum Entry<P> {
-    Resolved(u16),
-    Pending(Vec<P>),
+pub struct Fdb {
+    table: BTreeMap<MacAddr, u16>,
 }
 
-pub struct Fdb<P> {
-    table: BTreeMap<MacAddr, Entry<P>>,
-    cache_size: usize,
-}
-
-impl<P> Fdb<P> {
-    pub fn new(cache_size: usize) -> Self {
+impl Fdb {
+    pub fn new() -> Self {
         Self {
             table: BTreeMap::new(),
-            cache_size,
         }
     }
 
-    pub fn insert(&mut self, src: MacAddr, port: u16) -> Option<Vec<P>> {
-        if let Some(Entry::Pending(packets)) = self.table.insert(src, Entry::Resolved(port)) {
-            Some(packets)
-        } else {
-            None
-        }
+    /// Record `src → port`. Overwrites any previous mapping for `src` so that
+    /// a host that roams between physical ports gets re-learned on the new
+    /// port the next time we see traffic from it.
+    pub fn insert(&mut self, src: MacAddr, port: u16) {
+        self.table.insert(src, port);
     }
 
-    pub fn resolve(&mut self, dst: MacAddr, packet: P) -> Option<u16> {
-        let e = self
-            .table
-            .entry(dst)
-            .or_insert_with(|| Entry::Pending(Vec::with_capacity(self.cache_size)));
-        match e {
-            Entry::Resolved(port) => Some(*port),
-            Entry::Pending(packets) => {
-                if packets.len() == self.cache_size {
-                    // Cache is full; drop the packet and don't add it to the pending list.
-                    eprintln!(
-                        "[WARN]: FDB pending list for {} is full; dropping packet",
-                        display_mac(&dst)
-                    );
-                } else {
-                    packets.push(packet);
-                }
-                None
-            }
+    /// Look up the egress port we last learned for `dst`. `None` means
+    /// "unknown unicast" — the caller should flood.
+    pub fn lookup(&self, dst: MacAddr) -> Option<u16> {
+        self.table.get(&dst).copied()
+    }
+
+    /// Number of MACs currently learned.
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty()
+    }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "FDB entries:")?;
+        for (mac, port) in &self.table {
+            writeln!(f, "  {} → port {}", display_mac(mac), port)?;
         }
+        Ok(())
     }
 }
 
-pub struct SharedFdb<P> {
-    inner: Arc<SpinLock<Fdb<P>>>,
+impl Default for Fdb {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<P> SharedFdb<P> {
-    pub fn new(cache_size: usize) -> Self {
+/// Cloneable handle to an [`Fdb`] shared across workers. Operations take the
+/// spinlock briefly; both `insert` and `lookup` are O(log n) BTree ops.
+#[derive(Clone)]
+pub struct SharedFdb {
+    inner: Arc<SpinLock<Fdb>>,
+}
+
+impl SharedFdb {
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(SpinLock::new(Fdb::new(cache_size))),
+            inner: Arc::new(SpinLock::new(Fdb::new())),
         }
     }
 
-    pub fn insert(&self, src: MacAddr, port: u16) -> Option<Vec<P>> {
-        self.inner.with(|inner| inner.insert(src, port))
+    pub fn insert(&self, src: MacAddr, port: u16) {
+        self.inner.with(|inner| inner.insert(src, port));
     }
 
-    pub fn resolve(&self, dst: MacAddr, packet: P) -> Option<u16> {
-        self.inner.with(|inner| inner.resolve(dst, packet))
+    pub fn lookup(&self, dst: MacAddr) -> Option<u16> {
+        self.inner.with(|inner| inner.lookup(dst))
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.with(|inner| inner.len())
+    }
+}
+
+impl Default for SharedFdb {
+    fn default() -> Self {
+        Self::new()
     }
 }

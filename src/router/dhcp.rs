@@ -227,6 +227,13 @@ impl DhcpServer {
         }
         Some(DhcpHeader::LEN + w.len())
     }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "DHCP server at {}:", self.cfg.server_ip)?;
+        self.leases.status(f)?;
+        self.pool.status(f)?;
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------------- //
@@ -367,6 +374,28 @@ impl DhcpClient {
         };
         frame::build_udp_ipv4(out, &params, &payload[..plen])
     }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "DHCP client with MAC {:02x?}:", self.mac)?;
+        writeln!(f, "  State: {:?}", self.state)?;
+        if let Some(lease) = &self.lease {
+            writeln!(f, "  Lease:")?;
+            writeln!(f, "    IP: {}", lease.ip)?;
+            if let Some(mask) = lease.subnet_mask {
+                writeln!(f, "    Subnet mask: {}", mask)?;
+            }
+            if let Some(gw) = lease.gateway {
+                writeln!(f, "    Gateway: {}", gw)?;
+            }
+            if let Some(sid) = lease.server_id {
+                writeln!(f, "    Server ID: {}", sid)?;
+            }
+            if let Some(secs) = lease.lease_secs {
+                writeln!(f, "    Lease time: {} seconds", secs)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A shared implementation of the DHCP client that can be used across workers
@@ -402,6 +431,10 @@ impl SharedDhcpClient {
 
     pub fn on_receive(&self, view: &DhcpView) {
         self.inner.with_write(|inner| inner.on_receive(view))
+    }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        self.inner.with_read(|inner| inner.status(f))
     }
 }
 

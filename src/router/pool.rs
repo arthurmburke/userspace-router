@@ -37,6 +37,10 @@ impl SharedAddressPool {
     pub fn end(&self) -> Ipv4Addr {
         self.inner.with(|inner| inner.end())
     }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        self.inner.with(|inner| inner.status(f))
+    }
 }
 
 pub struct AddressPool {
@@ -178,6 +182,14 @@ impl AddressPool {
 
     pub fn end(&self) -> Ipv4Addr {
         self.end
+    }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "  Address pool:")?;
+        for (s, e) in &self.intervals {
+            writeln!(f, "    {} - {}", s, e)?;
+        }
+        Ok(())
     }
 }
 

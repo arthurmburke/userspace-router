@@ -12,11 +12,13 @@
 //! [`translate_egress`] works on a raw packet slice (an mbuf's `data_mut`), so
 //! it's pure and unit-tested here; [`crate::router::worker`] is the DPDK glue.
 
+use crate::core::spinlock::SpinLock;
 use crate::net::checksum;
 use crate::net::ip::proto;
 use crate::net::view;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 
 /// Source-address field offset within the IPv4 header.
 const IP_SRC_OFFSET: usize = 12;
@@ -323,6 +325,47 @@ fn apply_rewrite(
             updated = 0xffff;
         }
         frame[l4c_off..l4c_off + 2].copy_from_slice(&updated.to_be_bytes());
+    }
+}
+
+/// Cloneable handle to a [`Nat`] shared across workers. Cloning bumps the
+/// `Arc` refcount; every clone observes the same forward/reverse tables and
+/// external-port pool.
+///
+/// Locking: every operation takes the spinlock briefly. NAT translation is
+/// short (a hash lookup + a few arithmetic ops), so contention stays low even
+/// at line rate.
+#[derive(Clone)]
+pub struct SharedNat {
+    inner: Arc<SpinLock<Nat>>,
+}
+
+impl SharedNat {
+    pub fn new(nat: Nat) -> Self {
+        Self {
+            inner: Arc::new(SpinLock::new(nat)),
+        }
+    }
+
+    /// Update the WAN address (e.g. when the DHCP lease binds or changes).
+    pub fn set_wan_ip(&self, ip: Ipv4Addr) {
+        self.inner.with(|n| n.set_wan_ip(ip));
+    }
+
+    pub fn wan_ip(&self) -> Ipv4Addr {
+        self.inner.with(|n| n.wan_ip())
+    }
+
+    /// Apply egress NAT to `frame` in place under the lock. See
+    /// [`translate_egress`].
+    pub fn translate_egress(&self, frame: &mut [u8]) -> Option<Egress> {
+        self.inner.with(|n| translate_egress(frame, n))
+    }
+
+    /// Apply ingress NAT to `frame` in place under the lock. See
+    /// [`translate_ingress`].
+    pub fn translate_ingress(&self, frame: &mut [u8]) -> Option<Ingress> {
+        self.inner.with(|n| translate_ingress(frame, n))
     }
 }
 

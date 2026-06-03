@@ -530,7 +530,7 @@ impl Port {
     pub fn transmit_frame(&self, lcore: u32, frame: &[u8]) -> bool {
         let Some(mut m) = self.alloc() else {
             eprintln!(
-                "[ERROR]: failed to allocate pool on lcore {lcore} port {}",
+                "[ERROR]: failed to allocate mbuf from pool on lcore {lcore} port {}",
                 self.port_id()
             );
             return false;

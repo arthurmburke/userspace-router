@@ -25,9 +25,11 @@ mod runtime {
     use userspace_router::dpdk::{self, ffi};
     use userspace_router::router::app::{self, AppCtx, LanPortCtx, PortCtx, WanPortCtx, launch_worker};
     use userspace_router::router::conf::{InterfaceRole, RouterConfig};
+    use userspace_router::router::conntrack::SharedConnTrack;
     use userspace_router::router::dhcp::{DhcpClient, DhcpServer, DhcpServerConfig, SharedDhcpClient};
     use userspace_router::router::fdb::SharedFdb;
     use userspace_router::router::leases::SharedLeases;
+    use userspace_router::router::nat::{Nat, SharedNat};
     use userspace_router::router::neighbor::SharedNeighbor;
     use userspace_router::router::pool::SharedAddressPool;
     use std::collections::BTreeMap;
@@ -50,6 +52,13 @@ mod runtime {
     const LEASE_SECS: u32 = 86_400;
     /// Transaction id seed for the WAN client ("quic" in ASCII).
     const WAN_XID: u32 = 0x7175_6963;
+
+    /// External-port range the NAT pool allocates from. 40000–65535 is the
+    /// IANA "dynamic / private" range, well above anything a host would bind
+    /// statically. The full range gives us 25,536 simultaneous external ports
+    /// per L4 protocol.
+    const NAT_PORT_LO: u16 = 40_000;
+    const NAT_PORT_HI: u16 = 65_535;
 
     pub fn run() {
         // Deserialize router configuration file a router config file
@@ -238,14 +247,46 @@ mod runtime {
             .chain(lan.into_iter())
             .collect::<Vec<_>>();
 
-        // FDB table for forwarding within the LAN segment
-        let fdb = SharedFdb::<Mbuf>::new(128);
+        // FDB: a plain MAC → port cache. Unknown unicast floods, so the FDB
+        // doesn't need to queue packets while waiting to learn a destination
+        // — the flood reaches the host.
+        let fdb = SharedFdb::new();
 
-        let ctx = Arc::new(AppCtx::new(server_ip, software_defined_addr, fdb, port_ctx));
+        // NAT table: the WAN IP starts unspecified; it's set on the first DHCP
+        // bind transition inside drive_wan. Until then translate_egress returns
+        // None (because there's no source endpoint to map to a real address)
+        // and packets are dropped at the egress edge.
+        let nat = SharedNat::new(Nat::new(
+            Ipv4Addr::UNSPECIFIED,
+            NAT_PORT_LO,
+            NAT_PORT_HI,
+        ));
 
-        // Handle CTRL-C gracefully so we can stop ports and run rte_eal_cleanup
-        // instead of being killed by the default signal handler mid-burst.
-        app::setup_sigint_handler();
+        // TCP connection-tracking firewall. Starts empty; outbound TCP packets
+        // populate it (observe_egress on SYN/FIN), inbound packets are gated
+        // against it (check_ingress). Non-TCP traffic skips this layer
+        // entirely — it's dropped at the egress/ingress edges in app.rs.
+        let conntrack = SharedConnTrack::new();
+
+        // Main lcore acts as both a worker AND the neighbor-table sweeper. We
+        // could pick any lcore, but the main thread is the natural choice — it's
+        // guaranteed to exist (workers may have failed to launch) and isn't
+        // affected by `rte_lcore_is_enabled` filtering.
+        let ctx = Arc::new(AppCtx::new(
+            server_ip,
+            software_defined_addr,
+            fdb,
+            nat,
+            conntrack,
+            port_ctx,
+            main_lcore,
+        ));
+
+        // Handle CTRL-C / SIGTERM gracefully so we can stop ports and run
+        // rte_eal_cleanup instead of being killed by the default signal handler
+        // mid-burst. setup_sigint_handler logs and counts install failures; we
+        // continue regardless because the rest of the runtime is still useful.
+        let _ = app::setup_sigint_handler();
 
         for lcore in &lcores {
             if lcore.id != main_lcore {

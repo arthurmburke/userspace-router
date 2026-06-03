@@ -55,6 +55,12 @@ impl Tick {
     }
 }
 
+impl Display for Tick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ms", self.0)
+    }
+}
+
 /// A cache entry plus when it was learned, so [`NeighborTable::sweep`] can age
 /// it out.
 #[derive(Clone, Copy)]
@@ -232,6 +238,20 @@ impl<P> NeighborTable<P> {
         self.resolved.retain(|_, ip| self.cache.contains_key(ip));
 
         dropped
+    }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "ARP:")?;
+        writeln!(f, "  our_mac: {}, our_ip: {}", self.our_mac, self.our_ip)?;
+        writeln!(f, "  cache:")?;
+        for (ip, entry) in &self.cache {
+            writeln!(f, "    {} -> {} (learned at {:?})", ip, entry.mac, entry.learned_at)?;
+        }
+        writeln!(f, "  pending:")?;
+        for (ip, pending) in &self.pending {
+            writeln!(f, "    {}: {} packets, last request at {:?}, attempts {}", ip, pending.packets.len(), pending.last_request_at, pending.attempts)?;
+        }
+        writeln!(f, "}}")
     }
 }
 

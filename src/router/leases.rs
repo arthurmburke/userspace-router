@@ -51,6 +51,10 @@ impl SharedLeases {
     pub fn is_empty(&self) -> bool {
         self.inner.with(|t| t.is_empty())
     }
+
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        self.inner.with(|t| t.status(f))
+    }
 }
 
 impl Default for SharedLeases {
@@ -82,6 +86,13 @@ impl LeaseTable {
     }
     pub fn is_empty(&self) -> bool {
         self.by_mac.is_empty()
+    }
+    pub fn status(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        writeln!(f, "  Leases:")?;
+        for (mac, ip) in &self.by_mac {
+            writeln!(f, "    {:02x?} → {}", mac, ip)?;
+        }
+        Ok(())
     }
 }
 
